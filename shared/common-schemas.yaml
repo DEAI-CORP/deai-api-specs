@@ -1,0 +1,28 @@
+# Schemas dùng chung cho tất cả DEAI services
+components:
+  schemas:
+    SuccessResponse:
+      type: object
+      properties:
+        data:      { type: object }
+        error:     { type: "null" }
+        meta:      { type: object }
+        timestamp: { type: string, format: date-time }
+
+    ErrorResponse:
+      type: object
+      properties:
+        data:  { type: "null" }
+        error:
+          type: object
+          properties:
+            code:    { type: string }
+            message: { type: string }
+        timestamp: { type: string, format: date-time }
+
+    Pagination:
+      type: object
+      properties:
+        page:  { type: integer }
+        total: { type: integer }
+        limit: { type: integer }
