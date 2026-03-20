@@ -1,0 +1,726 @@
+openapi: "3.0.3"
+
+info:
+  title: "DEAI Patient App — Integration API"
+  description: |
+    ## Patient App Public API — dành cho tích hợp bên ngoài
+    
+    API này cho phép hệ thống EMR của bệnh viện (kể cả EMR bên thứ 3) kết nối với
+    Patient App để đồng bộ dữ liệu bệnh nhân, lịch hẹn, kết quả CLS, và gửi thông báo.
+    
+    ### Ai dùng API này?
+    - **EMR DEAI**: kết nối nội bộ qua RabbitMQ (không cần gọi REST)
+    - **EMR bên thứ 3 của bệnh viện**: gọi REST API này với API Key
+    - **HIS/LIS của bệnh viện**: đồng bộ dữ liệu qua REST hoặc Webhook
+    
+    ### Authentication
+    - **API Key**: dành cho service-to-service (`X-API-Key` header)
+    - **Service Key**: dành cho internal DEAI services (`X-Service-Key` header)
+    - **JWT Bearer**: dành cho user-facing endpoints
+    
+    ### Base URL
+    - Production: `https://api.hospital.vn/api/v1`
+    - Staging:    `https://staging-api.hospital.vn/api/v1`
+    
+    ### Versioning
+    Tất cả endpoint có prefix `/api/v1/`. Breaking changes sẽ tạo `/api/v2/`.
+    
+    ### Webhook
+    Patient App hỗ trợ push event ra ngoài. Đăng ký webhook tại `/webhooks`.
+    Events: `appointment.created`, `appointment.cancelled`, `document.signed`
+  version: "1.0.0"
+  contact:
+    name: "DEAI Corp — API Support"
+    email: "api@deai.vn"
+    url: "https://developer.deai.vn"
+
+servers:
+  - url: "https://api.hospital.vn/api/v1"
+    description: "Production (qua Kong)"
+  - url: "https://staging-api.hospital.vn/api/v1"
+    description: "Staging"
+  - url: "http://localhost:3000/api/v1"
+    description: "Local dev (auth-service trực tiếp)"
+
+security:
+  - ApiKeyAuth: []
+
+tags:
+  - name: Auth
+    description: "Xác thực — lấy JWT token"
+  - name: Patients
+    description: "Thông tin bệnh nhân"
+  - name: Appointments
+    description: "Lịch hẹn khám"
+  - name: HealthRecords
+    description: "Hồ sơ sức khỏe — kết quả CLS, lịch sử khám"
+  - name: Notifications
+    description: "Push notification qua Firebase FCM"
+  - name: Documents
+    description: "Tài liệu y tế đã ký số"
+  - name: Webhooks
+    description: "Đăng ký nhận event từ Patient App"
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: "JWT RS256 từ auth-service. Lấy qua POST /auth/login"
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: "API Key cho EMR/HIS bên thứ 3. Đăng ký tại developer.deai.vn"
+    ServiceKeyAuth:
+      type: apiKey
+      in: header
+      name: X-Service-Key
+      description: "Internal service key — chỉ dành cho DEAI services (EMR, HIS, LIS)"
+
+  schemas:
+    # ── Envelope ──────────────────────────────────────────
+    SuccessResponse:
+      type: object
+      properties:
+        data:      { type: object }
+        error:     { type: "null" }
+        meta:      { type: object, properties: { page: { type: integer }, total: { type: integer }, limit: { type: integer } } }
+        timestamp: { type: string, format: date-time }
+
+    ErrorResponse:
+      type: object
+      properties:
+        data:  { type: "null" }
+        error: { type: object, properties: { code: { type: string }, message: { type: string } } }
+        meta:  { type: object }
+        timestamp: { type: string, format: date-time }
+
+    # ── Auth ──────────────────────────────────────────────
+    LoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username:     { type: string, example: "bsnguyenvana" }
+        password:     { type: string, format: password }
+        systemAccess: { type: string, example: "emr", description: "Hệ thống muốn truy cập" }
+
+    TokenResponse:
+      type: object
+      properties:
+        accessToken:  { type: string, description: "JWT RS256, TTL 86400s dev / 3600s prod" }
+        refreshToken: { type: string }
+        tokenType:    { type: string, example: "Bearer" }
+        expiresIn:    { type: integer, example: 3600 }
+        user:         { $ref: "#/components/schemas/UserProfile" }
+
+    UserProfile:
+      type: object
+      properties:
+        userId:      { type: string, example: "0223defa-9731-485f-889b-39587b08049c" }
+        roles:       { type: array, items: { type: string }, example: ["PATIENT"] }
+        hospitalId:  { type: string, example: "bv-001", description: "= tenantId trong EMR" }
+        identityLevel: { type: integer, example: 1 }
+
+    # ── Patient ───────────────────────────────────────────
+    Patient:
+      type: object
+      properties:
+        patientId:    { type: string, example: "pat-001" }
+        accountId:    { type: string, description: "ID tài khoản trong Patient App" }
+        fullName:     { type: string, example: "Nguyễn Văn B" }
+        dob:          { type: string, format: date, example: "1985-06-15" }
+        gender:       { type: string, enum: [MALE, FEMALE, OTHER] }
+        phone:        { type: string, example: "0901234567" }
+        nationalId:   { type: string, example: "034012345678" }
+        insuranceNo:  { type: string, example: "HS4030123456789" }
+        patientStatus:{ type: string, enum: [ACTIVE, INACTIVE] }
+        hospitalId:   { type: string, example: "bv-001" }
+
+    # ── Appointment ───────────────────────────────────────
+    Appointment:
+      type: object
+      properties:
+        appointmentId: { type: string }
+        accountId:     { type: string }
+        patientId:     { type: string }
+        type:          { type: string, enum: [bhyt, dichvu], example: "bhyt" }
+        department:    { type: string, example: "Nội khoa" }
+        scheduledAt:   { type: string, format: date-time }
+        doctorId:      { type: string, nullable: true }
+        status:        { type: string, enum: [PENDING, CONFIRMED, CANCELLED, COMPLETED] }
+        reason:        { type: string, nullable: true }
+        sourceRecordId:{ type: string, nullable: true, description: "Mã bệnh án gốc từ EMR" }
+        createdAt:     { type: string, format: date-time }
+
+    AppointmentCreate:
+      type: object
+      required: [accountId, patientId, type, department, scheduledAt]
+      properties:
+        accountId:     { type: string }
+        patientId:     { type: string }
+        type:          { type: string, enum: [bhyt, dichvu] }
+        department:    { type: string, example: "Nội khoa" }
+        scheduledAt:   { type: string, format: date-time }
+        doctorId:      { type: string }
+        reason:        { type: string }
+        sourceRecordId:{ type: string, description: "Mã bệnh án EMR để liên kết" }
+        notifyPatient: { type: boolean, default: true }
+
+    # ── Health Record ─────────────────────────────────────
+    LabResult:
+      type: object
+      properties:
+        resultId:    { type: string }
+        patientId:   { type: string }
+        testCode:    { type: string, example: "CBC" }
+        testName:    { type: string, example: "Công thức máu" }
+        status:      { type: string, enum: [PRELIMINARY, FINAL, CORRECTED] }
+        performedAt: { type: string, format: date-time }
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              code:        { type: string }
+              name:        { type: string }
+              value:       { type: string }
+              unit:        { type: string }
+              normalRange: { type: string }
+              isAbnormal:  { type: boolean }
+              flag:        { type: string, enum: [H, L, C, N] }
+        conclusion: { type: string, nullable: true }
+        pdfUrl:     { type: string, format: uri, nullable: true }
+
+    # ── Notification ──────────────────────────────────────
+    NotificationPayload:
+      type: object
+      required: [accountId, recipientType, type, category, title, body]
+      properties:
+        accountId:     { type: string, description: "userId người nhận" }
+        recipientType: { type: string, enum: [PATIENT, STAFF] }
+        type:
+          type: string
+          enum:
+            - SIGN_PENDING
+            - SIGN_COMPLETED
+            - LAB_RESULT_READY
+            - LAB_RESULT_CRITICAL
+            - APPOINTMENT_CREATED
+            - APPOINTMENT_REMINDER
+            - RECORD_DISCHARGED
+            - ALLERGY_ALERT
+            - GENERAL
+        category:  { type: string, enum: [medical, appointment, system] }
+        title:     { type: string, example: "Kết quả xét nghiệm đã có" }
+        body:      { type: string, example: "Công thức máu của bạn đã được cập nhật" }
+        data:      { type: object, additionalProperties: { type: string }, description: "Deep link data cho app" }
+        priority:  { type: string, enum: [HIGH, NORMAL], default: "NORMAL" }
+
+    # ── Webhook ───────────────────────────────────────────
+    WebhookRegistration:
+      type: object
+      required: [url, events, secret]
+      properties:
+        url:    { type: string, format: uri, example: "https://emr.hospital.vn/webhooks/patient-app" }
+        events:
+          type: array
+          items: { type: string }
+          example: ["appointment.created", "appointment.cancelled", "document.signed"]
+        secret: { type: string, description: "HMAC-SHA256 secret để verify signature" }
+        active: { type: boolean, default: true }
+
+paths:
+
+  # ── AUTH ──────────────────────────────────────────────────
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: "Đăng nhập — lấy JWT token"
+      description: |
+        Token trả về là JWT RS256, dùng được cho cả Patient App lẫn EMR (SSO).
+        EMR verify bằng `jwt_public.pem` của Patient App.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/LoginRequest" }
+            example:
+              username: "bsnguyenvana"
+              password: "SecurePass123!"
+              systemAccess: "emr"
+      responses:
+        "200":
+          description: "Đăng nhập thành công"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessResponse"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/TokenResponse" }
+        "401": { description: "Sai username hoặc password" }
+        "423": { description: "Tài khoản bị khóa" }
+
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      summary: "Refresh access token"
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refreshToken]
+              properties:
+                refreshToken: { type: string }
+      responses:
+        "200": { description: "Token mới" }
+        "401": { description: "Refresh token hết hạn" }
+
+  # ── PATIENTS ──────────────────────────────────────────────
+  /patients/{patientId}:
+    get:
+      tags: [Patients]
+      summary: "Lấy thông tin bệnh nhân"
+      description: "EMR/HIS gọi để lấy thông tin BN đã đăng ký trong Patient App."
+      security:
+        - ApiKeyAuth: []
+        - ServiceKeyAuth: []
+      parameters:
+        - name: patientId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: "Thông tin bệnh nhân"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessResponse"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/Patient" }
+        "404": { description: "Không tìm thấy bệnh nhân" }
+
+  /patients/search:
+    get:
+      tags: [Patients]
+      summary: "Tìm kiếm bệnh nhân"
+      security:
+        - ApiKeyAuth: []
+        - ServiceKeyAuth: []
+      parameters:
+        - name: q
+          in: query
+          description: "Tìm theo tên, SĐT, CCCD"
+          schema: { type: string }
+        - name: hospitalId
+          in: query
+          schema: { type: string, example: "bv-001" }
+        - name: page
+          in: query
+          schema: { type: integer, default: 1 }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 20 }
+      responses:
+        "200":
+          description: "Danh sách bệnh nhân"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessResponse"
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: "#/components/schemas/Patient" }
+
+  /patients/{patientId}/allergies:
+    get:
+      tags: [Patients]
+      summary: "Danh sách dị ứng thuốc"
+      description: "EMR dùng để cảnh báo khi BS kê đơn."
+      security:
+        - ApiKeyAuth: []
+        - ServiceKeyAuth: []
+      parameters:
+        - name: patientId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: "Danh sách dị ứng"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessResponse"
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            allergyId:   { type: string }
+                            drugName:    { type: string, example: "Penicillin" }
+                            drugCode:    { type: string }
+                            severity:    { type: string, enum: [MILD, MODERATE, SEVERE, ANAPHYLAXIS] }
+                            reaction:    { type: string }
+                            recordedAt:  { type: string, format: date-time }
+
+    post:
+      tags: [Patients]
+      summary: "Thêm dị ứng thuốc"
+      description: "EMR ghi nhận dị ứng mới sau khi BS phát hiện."
+      security:
+        - ServiceKeyAuth: []
+      parameters:
+        - name: patientId
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [drugName, severity]
+              properties:
+                drugName: { type: string }
+                drugCode: { type: string }
+                severity: { type: string, enum: [MILD, MODERATE, SEVERE, ANAPHYLAXIS] }
+                reaction: { type: string }
+      responses:
+        "201": { description: "Thêm thành công" }
+
+  # ── APPOINTMENTS ──────────────────────────────────────────
+  /appointments:
+    post:
+      tags: [Appointments]
+      summary: "Tạo lịch hẹn tái khám"
+      description: |
+        EMR gọi khi BS tạo lịch hẹn tái khám cho BN sau khi xuất viện.
+        Patient App sẽ tự động gửi FCM notification cho BN.
+      security:
+        - ApiKeyAuth: []
+        - ServiceKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AppointmentCreate" }
+            example:
+              accountId:     "acc-001"
+              patientId:     "pat-001"
+              type:          "bhyt"
+              department:    "Nội khoa"
+              scheduledAt:   "2026-04-15T09:00:00+07:00"
+              doctorId:      "usr-bs-001"
+              reason:        "Tái khám sau điều trị viêm phổi"
+              sourceRecordId:"rec-20260319-001"
+              notifyPatient: true
+      responses:
+        "201":
+          description: "Tạo lịch hẹn thành công"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessResponse"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/Appointment" }
+
+  /appointments/{patientId}:
+    get:
+      tags: [Appointments]
+      summary: "Lịch hẹn của bệnh nhân"
+      security:
+        - ApiKeyAuth: []
+        - ServiceKeyAuth: []
+      parameters:
+        - name: patientId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: status
+          in: query
+          schema: { type: string, enum: [PENDING, CONFIRMED, CANCELLED, COMPLETED] }
+      responses:
+        "200":
+          description: "Danh sách lịch hẹn"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessResponse"
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: "#/components/schemas/Appointment" }
+
+  /appointments/{appointmentId}:
+    patch:
+      tags: [Appointments]
+      summary: "Cập nhật lịch hẹn"
+      security:
+        - ApiKeyAuth: []
+        - ServiceKeyAuth: []
+      parameters:
+        - name: appointmentId
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                status:      { type: string, enum: [CONFIRMED, CANCELLED] }
+                scheduledAt: { type: string, format: date-time }
+                reason:      { type: string }
+      responses:
+        "200": { description: "Cập nhật thành công" }
+
+  # ── HEALTH RECORDS ────────────────────────────────────────
+  /health-records/{patientId}/lab-results:
+    get:
+      tags: [HealthRecords]
+      summary: "Kết quả xét nghiệm"
+      description: "EMR và Patient App đều gọi endpoint này để xem kết quả CLS."
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      parameters:
+        - name: patientId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: abnormalOnly
+          in: query
+          schema: { type: boolean }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 20 }
+      responses:
+        "200":
+          description: "Danh sách kết quả XN"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessResponse"
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: "#/components/schemas/LabResult" }
+
+    post:
+      tags: [HealthRecords]
+      summary: "Thêm kết quả xét nghiệm"
+      description: "LIS của bệnh viện gọi để push kết quả vào Patient App (REST fallback, ưu tiên dùng RabbitMQ)."
+      security:
+        - ApiKeyAuth: []
+        - ServiceKeyAuth: []
+      parameters:
+        - name: patientId
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/LabResult" }
+      responses:
+        "201": { description: "Thêm thành công, FCM gửi tới BN" }
+
+  /health-records/{patientId}/history:
+    get:
+      tags: [HealthRecords]
+      summary: "Lịch sử khám bệnh"
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      parameters:
+        - name: patientId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 10 }
+      responses:
+        "200":
+          description: "Lịch sử khám"
+
+  # ── NOTIFICATIONS ─────────────────────────────────────────
+  /notifications/internal:
+    post:
+      tags: [Notifications]
+      summary: "Gửi push notification (service-to-service)"
+      description: |
+        EMR và các DEAI services gọi endpoint này để push FCM notification.
+        **Không dùng JWT user token** — dùng `X-Service-Key` header.
+        
+        Patient App team cần thêm endpoint này (chưa có trong version hiện tại).
+      security:
+        - ServiceKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/NotificationPayload" }
+            examples:
+              signPending:
+                summary: "Phiếu chờ ký"
+                value:
+                  accountId:     "usr-bs-001"
+                  recipientType: "STAFF"
+                  type:          "SIGN_PENDING"
+                  category:      "medical"
+                  title:         "Phiếu chờ ký số"
+                  body:          "Giấy cam kết phẫu thuật đang chờ chữ ký của bạn"
+                  data:          { recordId: "rec-001", formId: "form-001", screen: "sign-inbox" }
+                  priority:      "HIGH"
+              labResult:
+                summary: "Kết quả XN mới"
+                value:
+                  accountId:     "acc-patient-001"
+                  recipientType: "PATIENT"
+                  type:          "LAB_RESULT_READY"
+                  category:      "medical"
+                  title:         "Kết quả xét nghiệm đã có"
+                  body:          "Công thức máu của bạn đã được cập nhật"
+                  data:          { screen: "health-records" }
+                  priority:      "NORMAL"
+      responses:
+        "200":
+          description: "Notification đã gửi"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessResponse"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          sent:    { type: boolean }
+                          fcmId:   { type: string, nullable: true }
+        "401": { description: "X-Service-Key không hợp lệ" }
+
+  # ── WEBHOOKS ──────────────────────────────────────────────
+  /webhooks:
+    post:
+      tags: [Webhooks]
+      summary: "Đăng ký webhook"
+      description: |
+        EMR/HIS đăng ký URL để nhận event từ Patient App.
+        
+        **Events có thể subscribe:**
+        - `appointment.created` — BN đặt lịch hẹn mới
+        - `appointment.cancelled` — BN hủy lịch hẹn
+        - `document.signed` — BN ký tài liệu
+        - `patient.registered` — BN đăng ký tài khoản mới
+        
+        **Signature verification:**
+        Mỗi request có header `X-DEAI-Signature: sha256=<hmac>`
+        Verify: `HMAC-SHA256(secret, request_body) == signature`
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/WebhookRegistration" }
+            example:
+              url:    "https://emr.benhvien-xyz.vn/webhooks/patient-app"
+              events: ["appointment.created", "appointment.cancelled"]
+              secret: "my-webhook-secret-change-in-prod"
+      responses:
+        "201":
+          description: "Đăng ký thành công"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessResponse"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          webhookId: { type: string }
+                          url:       { type: string }
+                          events:    { type: array, items: { type: string } }
+
+    get:
+      tags: [Webhooks]
+      summary: "Danh sách webhook đã đăng ký"
+      security:
+        - ApiKeyAuth: []
+      responses:
+        "200": { description: "Danh sách webhooks" }
+
+  /webhooks/{webhookId}:
+    delete:
+      tags: [Webhooks]
+      summary: "Hủy webhook"
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: webhookId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: "Hủy thành công" }
+
+  # ── ESIGN (expose ra ngoài) ───────────────────────────────
+  /documents/{documentId}/signed-url:
+    get:
+      tags: [Documents]
+      summary: "Lấy URL download file đã ký"
+      description: "EMR hoặc BN dùng để download/xem file PDF đã ký số."
+      security:
+        - BearerAuth: []
+        - ServiceKeyAuth: []
+      parameters:
+        - name: documentId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: "Presigned URL (hết hạn sau 5 phút)"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessResponse"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          url:       { type: string, format: uri }
+                          expiresAt: { type: string, format: date-time }
