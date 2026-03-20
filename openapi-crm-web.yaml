@@ -1,0 +1,920 @@
+openapi: "3.0.3"
+
+info:
+  title: "DEAI CRM-web — Doctor & Nurse Portal API"
+  description: |
+    ## CRM-web Integration API — dành cho EMR bên thứ 3
+    
+    API này cho phép hệ thống EMR của bệnh viện kết nối với CRM-web để:
+    - Lấy thông tin nhân viên y tế (BS, ĐD) theo khoa
+    - Đồng bộ lịch làm việc, ca trực
+    - Đọc/ghi y lệnh, chỉ định CLS
+    - Nhận bàn giao ca
+    
+    ### Ai dùng API này?
+    - **EMR DEAI**: SSO + đọc thông tin nhân viên
+    - **EMR bên thứ 3 của BV**: kết nối để lấy danh sách BS/ĐD theo khoa
+    - **HIS của BV**: đồng bộ y lệnh, chỉ định CLS
+    
+    ### Authentication
+    - **JWT Bearer**: RS256, issuer `crm-auth-service` — dùng chung public key với Patient App
+    - **API Key**: cho EMR/HIS bên thứ 3
+    - **Service Key**: cho DEAI internal services
+    
+    ### JWT payload của CRM-web (sau khi update)
+    ```json
+    {
+      "sub":           "user-uuid",
+      "username":      "bsnguyenvana",
+      "role":          "BS",
+      "department_id": "dept-noi",
+      "hospital_id":   "bv-001",
+      "iss":           "crm-auth-service"
+    }
+    ```
+    
+    ### Role mapping
+    | CRM role | Nghĩa | EMR role |
+    |---|---|---|
+    | BS | Bác sĩ | DOCTOR |
+    | DTT | Điều dưỡng trưởng | HEAD_NURSE |
+    | DV | Điều dưỡng viên | NURSE |
+    | DS | Dược sĩ | PHARMACIST |
+    | BGD | Ban giám đốc | ADMIN |
+    | TK | Thư ký | SECRETARY |
+    | LT | Lễ tân | RECEPTIONIST |
+    | ITA | IT Admin | ADMIN |
+    | KT/NS/MKT | Kế toán/Nhân sự/Marketing | ❌ NO_ACCESS |
+    
+    ### Base URL
+    - Production: `https://crm.hospital.vn/api/v1`
+    - Staging:    `https://staging-crm.hospital.vn/api/v1`
+    - Local:      `http://localhost:3000/api/v1`
+  version: "1.0.0"
+  contact:
+    name: "DEAI Corp — CRM API Support"
+    email: "api@deai.vn"
+
+servers:
+  - url: "https://crm.hospital.vn/api/v1"
+    description: "Production"
+  - url: "https://staging-crm.hospital.vn/api/v1"
+    description: "Staging"
+  - url: "http://localhost:3000/api/v1"
+    description: "Local dev"
+
+security:
+  - BearerAuth: []
+
+tags:
+  - name: Auth
+    description: "Xác thực CRM-web"
+  - name: Staff
+    description: "Nhân viên y tế — BS, ĐD, DS"
+  - name: Departments
+    description: "Khoa/Phòng"
+  - name: Schedules
+    description: "Lịch làm việc, ca trực"
+  - name: MedicalOrders
+    description: "Y lệnh thuốc và y lệnh điều trị"
+  - name: LabOrders
+    description: "Chỉ định cận lâm sàng (XN, CĐHA)"
+  - name: Handovers
+    description: "Bàn giao ca, bàn giao BN"
+  - name: VitalSigns
+    description: "Chức năng sống (mạch, nhiệt, HA...)"
+  - name: SSO
+    description: "Single Sign-On với EMR-web"
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: "JWT RS256, issuer: crm-auth-service. Dùng chung public key với Patient App."
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: "API Key cho EMR/HIS bên thứ 3"
+    ServiceKeyAuth:
+      type: apiKey
+      in: header
+      name: X-Service-Key
+      description: "Internal key cho DEAI EMR"
+
+  schemas:
+    # ── Envelope ──────────────────────────────────────────
+    SuccessResponse:
+      type: object
+      properties:
+        data:      { type: object }
+        error:     { type: "null" }
+        meta:      { type: object, properties: { page: { type: integer }, total: { type: integer }, limit: { type: integer } } }
+        timestamp: { type: string, format: date-time }
+
+    ErrorResponse:
+      type: object
+      properties:
+        data:  { type: "null" }
+        error: { type: object, properties: { code: { type: string }, message: { type: string } } }
+        timestamp: { type: string, format: date-time }
+
+    # ── Auth ──────────────────────────────────────────────
+    LoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username: { type: string, example: "bsnguyenvana" }
+        password: { type: string, format: password }
+
+    CrmTokenResponse:
+      type: object
+      properties:
+        accessToken:
+          type: string
+          description: |
+            JWT RS256 với payload:
+            { sub, username, role, department_id, hospital_id, iss: 'crm-auth-service' }
+            Dùng được cho cả CRM-web lẫn EMR-web (SSO).
+        refreshToken: { type: string }
+        tokenType:    { type: string, example: "Bearer" }
+        expiresIn:    { type: integer, example: 3600 }
+        user:         { $ref: "#/components/schemas/StaffProfile" }
+
+    # ── Staff ─────────────────────────────────────────────
+    StaffProfile:
+      type: object
+      properties:
+        userId:       { type: string, example: "usr-bs-001" }
+        username:     { type: string, example: "bsnguyenvana" }
+        fullName:     { type: string, example: "BS. Nguyễn Văn A" }
+        role:         { type: string, enum: [BGD, BS, DTT, DV, DS, TK, LT, ITA, KT, NS, MKT] }
+        departmentId: { type: string, example: "dept-noi" }
+        departmentName:{ type: string, example: "Khoa Nội" }
+        hospitalId:   { type: string, example: "bv-001" }
+        phone:        { type: string, nullable: true }
+        avatarUrl:    { type: string, format: uri, nullable: true }
+        signatureUrl:
+          type: string
+          format: uri
+          nullable: true
+          description: "URL ảnh chữ ký — EMR dùng để render trên phiếu biểu"
+        licenseNo:    { type: string, nullable: true, description: "Số chứng chỉ hành nghề" }
+        title:        { type: string, example: "Bác sĩ CKI", nullable: true }
+
+    # ── Department ────────────────────────────────────────
+    Department:
+      type: object
+      properties:
+        departmentId:  { type: string, example: "dept-noi" }
+        name:          { type: string, example: "Khoa Nội" }
+        code:          { type: string, example: "NOI" }
+        hospitalId:    { type: string, example: "bv-001" }
+        headDoctorId:  { type: string, nullable: true }
+        headNurseId:   { type: string, nullable: true }
+
+    # ── Schedule ──────────────────────────────────────────
+    Schedule:
+      type: object
+      properties:
+        scheduleId:   { type: string }
+        userId:       { type: string }
+        departmentId: { type: string }
+        date:         { type: string, format: date }
+        shift:        { type: string, enum: [MORNING, AFTERNOON, NIGHT, ALL_DAY] }
+        startTime:    { type: string, example: "07:00" }
+        endTime:      { type: string, example: "13:00" }
+        type:         { type: string, enum: [REGULAR, OVERTIME, ON_CALL] }
+
+    # ── Medical Order ─────────────────────────────────────
+    MedicalOrder:
+      type: object
+      properties:
+        orderId:      { type: string }
+        patientId:    { type: string }
+        visitId:      { type: string }
+        doctorId:     { type: string }
+        departmentId: { type: string }
+        orderType:    { type: string, enum: [MEDICATION, PROCEDURE, DIET, ACTIVITY] }
+        status:       { type: string, enum: [PENDING, CONFIRMED, CANCELLED, COMPLETED] }
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              code:      { type: string, example: "J01CA01" }
+              name:      { type: string, example: "Amoxicillin 500mg" }
+              quantity:  { type: number }
+              unit:      { type: string, example: "viên" }
+              frequency: { type: string, example: "3 lần/ngày" }
+              route:     { type: string, example: "Uống" }
+              duration:  { type: string, example: "7 ngày" }
+              note:      { type: string, nullable: true }
+        diagnosis:    { type: string, nullable: true }
+        note:         { type: string, nullable: true }
+        orderedAt:    { type: string, format: date-time }
+        sourceEmrId:  { type: string, nullable: true, description: "Mã bệnh án EMR để liên kết" }
+
+    MedicalOrderCreate:
+      type: object
+      required: [patientId, visitId, orderType, items]
+      properties:
+        patientId:    { type: string }
+        visitId:      { type: string }
+        orderType:    { type: string, enum: [MEDICATION, PROCEDURE, DIET, ACTIVITY] }
+        items:
+          type: array
+          items:
+            type: object
+            required: [name, quantity, unit]
+            properties:
+              code:      { type: string }
+              name:      { type: string }
+              quantity:  { type: number }
+              unit:      { type: string }
+              frequency: { type: string }
+              route:     { type: string }
+              duration:  { type: string }
+              note:      { type: string }
+        diagnosis:    { type: string }
+        note:         { type: string }
+        sourceEmrId:  { type: string }
+
+    # ── Lab Order ─────────────────────────────────────────
+    LabOrder:
+      type: object
+      properties:
+        labOrderId:   { type: string }
+        patientId:    { type: string }
+        visitId:      { type: string }
+        doctorId:     { type: string }
+        departmentId: { type: string }
+        tests:
+          type: array
+          items:
+            type: object
+            properties:
+              testCode: { type: string, example: "CBC" }
+              testName: { type: string, example: "Công thức máu" }
+              urgent:   { type: boolean, default: false }
+        status:     { type: string, enum: [PENDING, SENT_TO_LIS, COMPLETED, CANCELLED] }
+        orderedAt:  { type: string, format: date-time }
+        sourceEmrId:{ type: string, nullable: true }
+
+    # ── Handover ──────────────────────────────────────────
+    Handover:
+      type: object
+      properties:
+        handoverId:   { type: string }
+        departmentId: { type: string }
+        shift:        { type: string, enum: [MORNING, AFTERNOON, NIGHT] }
+        handoverDate: { type: string, format: date }
+        fromNurseId:  { type: string }
+        toNurseId:    { type: string }
+        patientCount: { type: integer }
+        summary:      { type: string }
+        patients:
+          type: array
+          items:
+            type: object
+            properties:
+              patientId:   { type: string }
+              visitId:     { type: string }
+              fullName:    { type: string }
+              condition:   { type: string, enum: [STABLE, CRITICAL, IMPROVING, DETERIORATING] }
+              notes:       { type: string }
+              pendingTasks:{ type: array, items: { type: string } }
+        createdAt:    { type: string, format: date-time }
+
+    # ── Vital Signs ───────────────────────────────────────
+    VitalSign:
+      type: object
+      properties:
+        vitalId:      { type: string }
+        patientId:    { type: string }
+        visitId:      { type: string }
+        recordedBy:   { type: string }
+        recordedAt:   { type: string, format: date-time }
+        temperature:  { type: number, example: 37.2, description: "°C" }
+        pulse:        { type: integer, example: 80, description: "lần/phút" }
+        respiratoryRate: { type: integer, example: 18, description: "lần/phút" }
+        bloodPressureSystolic:  { type: integer, example: 120, description: "mmHg" }
+        bloodPressureDiastolic: { type: integer, example: 80, description: "mmHg" }
+        spo2:         { type: number, example: 98, description: "%" }
+        weight:       { type: number, example: 65.5, description: "kg" }
+        height:       { type: number, example: 170, description: "cm" }
+        consciousness:{ type: string, example: "Tỉnh táo" }
+        ewsScore:     { type: integer, nullable: true, description: "Early Warning Score — tự tính" }
+
+paths:
+
+  # ── AUTH ──────────────────────────────────────────────────
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: "Đăng nhập CRM-web"
+      description: |
+        Trả về JWT RS256 với issuer `crm-auth-service`.
+        Token này dùng được cho cả CRM-web lẫn EMR-web (SSO).
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/LoginRequest" }
+      responses:
+        "200":
+          description: "Đăng nhập thành công"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessResponse"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/CrmTokenResponse" }
+        "401": { description: "Sai username/password" }
+        "403": { description: "Role không có quyền truy cập" }
+
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      summary: "Refresh token"
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refreshToken]
+              properties:
+                refreshToken: { type: string }
+      responses:
+        "200": { description: "Token mới" }
+
+  # ── SSO ────────────────────────────────────────────────────
+  /auth/sso/emr-token:
+    post:
+      tags: [SSO]
+      summary: "Lấy token để SSO sang EMR-web"
+      description: |
+        CRM-web frontend gọi endpoint này trước khi redirect sang EMR-web.
+        Trả về short-lived token (5 phút) chỉ dùng cho SSO redirect.
+        
+        Flow:
+        1. Doctor click "Mở bệnh án EMR" trong CRM-web
+        2. Frontend gọi POST /auth/sso/emr-token
+        3. Nhận ssoToken
+        4. Redirect: window.open(`{EMR_URL}/sso?token={ssoToken}&visitId={visitId}`)
+        5. EMR-web verify token và tự động đăng nhập
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                visitId:   { type: string, description: "Mã lần khám — EMR mở thẳng bệnh án" }
+                patientId: { type: string }
+      responses:
+        "200":
+          description: "SSO token (hết hạn 5 phút)"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessResponse"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          ssoToken:  { type: string }
+                          expiresAt: { type: string, format: date-time }
+                          emrUrl:    { type: string, format: uri, description: "URL đầy đủ để redirect" }
+
+  # ── STAFF ──────────────────────────────────────────────────
+  /staff:
+    get:
+      tags: [Staff]
+      summary: "Danh sách nhân viên y tế"
+      description: "EMR dùng để hiển thị danh sách BS/ĐD khi phân công, chọn người ký."
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+        - ServiceKeyAuth: []
+      parameters:
+        - name: departmentId
+          in: query
+          schema: { type: string, example: "dept-noi" }
+          description: "Lọc theo khoa"
+        - name: role
+          in: query
+          schema: { type: string, enum: [BS, DTT, DV, DS] }
+          description: "Lọc theo role"
+        - name: hospitalId
+          in: query
+          schema: { type: string, example: "bv-001" }
+        - name: page
+          in: query
+          schema: { type: integer, default: 1 }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50 }
+      responses:
+        "200":
+          description: "Danh sách nhân viên"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessResponse"
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: "#/components/schemas/StaffProfile" }
+              example:
+                data:
+                  - userId: "usr-bs-001"
+                    fullName: "BS. Nguyễn Văn A"
+                    role: "BS"
+                    departmentId: "dept-noi"
+                    departmentName: "Khoa Nội"
+                    signatureUrl: "https://minio.hospital.vn/staff/sig/usr-bs-001.png"
+                meta: { page: 1, total: 12, limit: 50 }
+                timestamp: "2026-03-20T08:00:00Z"
+
+  /staff/{staffId}:
+    get:
+      tags: [Staff]
+      summary: "Thông tin chi tiết nhân viên"
+      description: "EMR dùng để auto-fill tên BS, chức danh vào phiếu biểu."
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+        - ServiceKeyAuth: []
+      parameters:
+        - name: staffId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: "Thông tin nhân viên"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessResponse"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/StaffProfile" }
+        "404": { description: "Không tìm thấy nhân viên" }
+
+  /staff/{staffId}/signature:
+    patch:
+      tags: [Staff]
+      summary: "Upload ảnh chữ ký"
+      description: "BS/ĐD upload ảnh chữ ký — EMR dùng để render trên phiếu biểu khi in."
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: staffId
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                signature:
+                  type: string
+                  format: binary
+                  description: "File ảnh PNG/JPG, max 2MB, nền trắng"
+      responses:
+        "200":
+          description: "Upload thành công"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessResponse"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          signatureUrl: { type: string, format: uri }
+
+  # ── DEPARTMENTS ────────────────────────────────────────────
+  /departments:
+    get:
+      tags: [Departments]
+      summary: "Danh sách khoa/phòng"
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+        - ServiceKeyAuth: []
+      parameters:
+        - name: hospitalId
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: "Danh sách khoa"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessResponse"
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: "#/components/schemas/Department" }
+
+  /departments/{departmentId}/staff:
+    get:
+      tags: [Departments]
+      summary: "Nhân viên của một khoa"
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+        - ServiceKeyAuth: []
+      parameters:
+        - name: departmentId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: shift
+          in: query
+          schema: { type: string, enum: [MORNING, AFTERNOON, NIGHT] }
+          description: "Lọc nhân viên đang trực ca này"
+      responses:
+        "200":
+          description: "Nhân viên của khoa"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessResponse"
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: "#/components/schemas/StaffProfile" }
+
+  # ── SCHEDULES ──────────────────────────────────────────────
+  /schedules:
+    get:
+      tags: [Schedules]
+      summary: "Lịch làm việc"
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      parameters:
+        - name: departmentId
+          in: query
+          schema: { type: string }
+        - name: userId
+          in: query
+          schema: { type: string }
+        - name: dateFrom
+          in: query
+          schema: { type: string, format: date }
+        - name: dateTo
+          in: query
+          schema: { type: string, format: date }
+      responses:
+        "200":
+          description: "Lịch làm việc"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessResponse"
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: "#/components/schemas/Schedule" }
+
+    post:
+      tags: [Schedules]
+      summary: "Tạo lịch làm việc"
+      description: "EMR hoặc admin CRM tạo lịch trực, lịch phẫu thuật."
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [userId, departmentId, date, shift]
+              properties:
+                userId:       { type: string }
+                departmentId: { type: string }
+                date:         { type: string, format: date }
+                shift:        { type: string, enum: [MORNING, AFTERNOON, NIGHT, ALL_DAY] }
+                type:         { type: string, enum: [REGULAR, OVERTIME, ON_CALL] }
+      responses:
+        "201": { description: "Tạo thành công" }
+
+  # ── MEDICAL ORDERS ─────────────────────────────────────────
+  /medical-orders:
+    post:
+      tags: [MedicalOrders]
+      summary: "Tạo y lệnh"
+      description: |
+        BS kê y lệnh thuốc trong CRM-web.
+        EMR có thể gọi endpoint này để đồng bộ y lệnh từ EMR sang CRM.
+        Hiện tại y lệnh lưu trong CRM DB — chưa tự động submit về HIS.
+      security:
+        - BearerAuth: []
+        - ServiceKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/MedicalOrderCreate" }
+            example:
+              patientId:  "pat-001"
+              visitId:    "visit-20260319-001"
+              orderType:  "MEDICATION"
+              sourceEmrId:"rec-001"
+              items:
+                - name:      "Amoxicillin 500mg"
+                  code:      "J01CA01"
+                  quantity:  21
+                  unit:      "viên"
+                  frequency: "3 lần/ngày"
+                  route:     "Uống"
+                  duration:  "7 ngày"
+              diagnosis:  "Viêm phổi cộng đồng"
+      responses:
+        "201":
+          description: "Y lệnh tạo thành công"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessResponse"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/MedicalOrder" }
+
+  /medical-orders/{visitId}:
+    get:
+      tags: [MedicalOrders]
+      summary: "Y lệnh của một lần khám"
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+        - ServiceKeyAuth: []
+      parameters:
+        - name: visitId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: status
+          in: query
+          schema: { type: string, enum: [PENDING, CONFIRMED, COMPLETED] }
+      responses:
+        "200":
+          description: "Danh sách y lệnh"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessResponse"
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: "#/components/schemas/MedicalOrder" }
+
+  # ── LAB ORDERS ─────────────────────────────────────────────
+  /lab-orders:
+    post:
+      tags: [LabOrders]
+      summary: "Tạo chỉ định CLS"
+      description: |
+        BS chỉ định xét nghiệm, CĐHA.
+        Hiện tại lưu trong CRM DB — chưa kết nối LIS/PACS thật.
+        Khi có LIS: tự động forward sang LIS qua RabbitMQ.
+      security:
+        - BearerAuth: []
+        - ServiceKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [patientId, visitId, tests]
+              properties:
+                patientId:   { type: string }
+                visitId:     { type: string }
+                sourceEmrId: { type: string }
+                tests:
+                  type: array
+                  items:
+                    type: object
+                    required: [testCode, testName]
+                    properties:
+                      testCode: { type: string, example: "CBC" }
+                      testName: { type: string, example: "Công thức máu" }
+                      urgent:   { type: boolean, default: false }
+      responses:
+        "201":
+          description: "Chỉ định tạo thành công"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessResponse"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/LabOrder" }
+
+  /lab-orders/{visitId}:
+    get:
+      tags: [LabOrders]
+      summary: "Chỉ định CLS của một lần khám"
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+        - ServiceKeyAuth: []
+      parameters:
+        - name: visitId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: "Danh sách chỉ định CLS"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessResponse"
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: "#/components/schemas/LabOrder" }
+
+  # ── HANDOVERS ──────────────────────────────────────────────
+  /handovers:
+    get:
+      tags: [Handovers]
+      summary: "Danh sách bàn giao ca"
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      parameters:
+        - name: departmentId
+          in: query
+          schema: { type: string }
+        - name: date
+          in: query
+          schema: { type: string, format: date }
+        - name: shift
+          in: query
+          schema: { type: string, enum: [MORNING, AFTERNOON, NIGHT] }
+      responses:
+        "200":
+          description: "Danh sách bàn giao ca"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessResponse"
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: "#/components/schemas/Handover" }
+
+    post:
+      tags: [Handovers]
+      summary: "Tạo bàn giao ca"
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [departmentId, shift, handoverDate, toNurseId, patients]
+              properties:
+                departmentId: { type: string }
+                shift:        { type: string, enum: [MORNING, AFTERNOON, NIGHT] }
+                handoverDate: { type: string, format: date }
+                toNurseId:    { type: string }
+                summary:      { type: string }
+                patients:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      patientId:    { type: string }
+                      visitId:      { type: string }
+                      condition:    { type: string, enum: [STABLE, CRITICAL, IMPROVING, DETERIORATING] }
+                      notes:        { type: string }
+                      pendingTasks: { type: array, items: { type: string } }
+      responses:
+        "201":
+          description: "Bàn giao ca tạo thành công"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessResponse"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/Handover" }
+
+  # ── VITAL SIGNS ────────────────────────────────────────────
+  /vital-signs/{visitId}:
+    get:
+      tags: [VitalSigns]
+      summary: "Chức năng sống của một lần khám"
+      description: "EMR dùng để hiển thị biểu đồ theo dõi chức năng sống."
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+        - ServiceKeyAuth: []
+      parameters:
+        - name: visitId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 20 }
+      responses:
+        "200":
+          description: "Danh sách chức năng sống"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessResponse"
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: "#/components/schemas/VitalSign" }
+
+    post:
+      tags: [VitalSigns]
+      summary: "Ghi chức năng sống"
+      description: "ĐD ghi mạch, nhiệt, HA... Hệ thống tự tính EWS score."
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: visitId
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [patientId]
+              properties:
+                patientId:              { type: string }
+                temperature:            { type: number, example: 37.2 }
+                pulse:                  { type: integer, example: 80 }
+                respiratoryRate:        { type: integer, example: 18 }
+                bloodPressureSystolic:  { type: integer, example: 120 }
+                bloodPressureDiastolic: { type: integer, example: 80 }
+                spo2:                   { type: number, example: 98 }
+                weight:                 { type: number }
+                height:                 { type: number }
+                consciousness:          { type: string, example: "Tỉnh táo" }
+      responses:
+        "201":
+          description: "Ghi thành công, EWS được tính tự động"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessResponse"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/VitalSign" }
